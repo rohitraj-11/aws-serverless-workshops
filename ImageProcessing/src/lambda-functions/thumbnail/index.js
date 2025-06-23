@@ -1,102 +1,242 @@
-// dependencies
-const AWS = require('aws-sdk');
-const gm = require('gm').subClass({imageMagick: true}); // Enable ImageMagick integration.
-const util = require('util');
-const Promise = require('bluebird');
-Promise.promisifyAll(gm.prototype);
+const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const Jimp = require('jimp');
+const crypto = require('crypto');
 
-// constants
-const MAX_WIDTH = process.env.MAX_WIDTH ? process.env.MAX_WIDTH : 250;
-const MAX_HEIGHT = process.env.MAX_HEIGHT ? process.env.MAX_HEIGHT : 250;
+// Security-focused configuration
+const CONFIG = {
+    maxWidth: Math.min(parseInt(process.env.MAX_WIDTH) || 250, 2000), // Limit max size
+    maxHeight: Math.min(parseInt(process.env.MAX_HEIGHT) || 250, 2000),
+    quality: Math.min(parseInt(process.env.IMAGE_QUALITY) || 80, 100),
+    thumbnailBucket: process.env.THUMBNAIL_BUCKET,
+    maxFileSize: 15 * 1024 * 1024, // 15MB max file size
+    allowedMimeTypes: new Set(['image/jpeg', 'image/png', 'image/gif']),
+};
+// Initialize S3 client with secure configuration
+const s3Client = new S3Client({
+    maxAttempts: 3,
+    requestTimeout: 5000,
+    followRegionRedirects: false // Prevent SSRF
+});
+/**
+ * Validates and sanitizes the input parameters
+ * @param {Object} event - The Lambda event object
+ * @throws {Error} If validation fails
+ */
+const validateInput = (event) => {
+    // Required parameters check
+    if (!event.s3Bucket || !event.s3Key) {
+        throw new Error('Missing required parameters');
+    }
 
-const thumbnailBucket = process.env.THUMBNAIL_BUCKET;
+    // Validate destination bucket
+    if (!CONFIG.thumbnailBucket) {
+        throw new Error('Destination bucket not configured');
+    }
 
-// get reference to S3 client
-const s3 = new AWS.S3();
+    // S3 key validation
+    const keyPattern = /^[a-zA-Z0-9!_.*'()-\/]+$/;
+    if (!keyPattern.test(event.s3Key)) {
+        throw new Error('Invalid characters in S3 key');
+    }
 
-exports.handler = (event, context, callback) => {
-    console.log("Reading input from event:\n", util.inspect(event, {depth: 5}));
+    // Path traversal prevention
+    if (event.s3Key.includes('..')) {
+        throw new Error('Path traversal detected');
+    }
 
-    // get the object from S3 first
-    const s3Bucket = event.s3Bucket;
-    // Object key may have spaces or unicode non-ASCII characters.
-    const srcKey = decodeURIComponent(event.s3Key.replace(/\+/g, " "));
-    const getObjectPromise = s3.getObject({
-        Bucket: s3Bucket,
-        Key: srcKey
-    }).promise();
+    // Length limits
+    if (event.s3Key.length > 1024) {
+        throw new Error('S3 key exceeds maximum length');
+    }
+};
 
-    // identify image metadata
-    const identifyPromise = new Promise(resolve => {
-        getObjectPromise.then(getObjectResponse => {
-            console.log("success downloading from s3.");
-            gm(getObjectResponse.Body).identifyAsync().then(data => {
-                console.log("Identified metadata:\n", util.inspect(data, {depth: 5}));
-                resolve(data)
-            }).catch(err => {
-                callback(err);
-            });
-        }).catch(err => {
-            callback(err);
-        });
-    });
+/**
+ * Safely converts a stream to buffer with size limits
+ * @param {ReadableStream} stream - The input stream
+ * @returns {Promise<Buffer>} The resulting buffer
+ */
+const streamToBuffer = async (stream) => {
+    const chunks = [];
+    let totalSize = 0;
 
+    for await (const chunk of stream) {
+        totalSize += chunk.length;
+        if (totalSize > CONFIG.maxFileSize) {
+            throw new Error('File size exceeds maximum limit');
+        }
+        chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+};
 
-    // resize the image
-    var resizePromise = new Promise((resolve) => {
-        getObjectPromise.then((getObjectResponse) => {
-            identifyPromise.then(identified => {
-                const size = identified.size;
-                const scalingFactor = Math.min(
-                    MAX_WIDTH / size.width,
-                    MAX_HEIGHT / size.height
-                );
-                const width = scalingFactor * size.width;
-                const height = scalingFactor * size.height;
-                gm(getObjectResponse.Body).resize(width, height).toBuffer(identified.format, (err, buffer) => {
-                    if (err) {
-                        console.error("failure resizing to " + width + " x " + height);
-                        callback(err);
-                    } else {
-                        console.log("success resizing to " + width + " x " + height);
-                        resolve(buffer);
-                    }
-                });
-            }).catch(err => callback(err));
+/**
+ * Generates a secure filename for the thumbnail
+ * @param {string} originalKey - Original S3 key
+ * @returns {string} Secure filename
+ */
+const generateSecureFilename = (originalKey) => {
+    const timestamp = Date.now();
+    const random = crypto.randomBytes(8).toString('hex');
+    const extension = originalKey.split('.').pop().toLowerCase();
+    return `${timestamp}-${random}.${extension}`;
+};
 
-        }).catch(function (err) {
-            callback(err);
-        });
-    })
+/**
+ * Processes the image securely
+ * @param {Buffer} imageBuffer - The input image buffer
+ * @returns {Promise<{buffer: Buffer, mime: string}>}
+ */
+const processImage = async (imageBuffer) => {
+    // Validate buffer size
+    if (imageBuffer.length > CONFIG.maxFileSize) {
+        throw new Error('Input file too large');
+    }
 
-    // upload the result image back to s3
-    const destKey = "resized-" + srcKey;
+    let image;
+    try {
+        image = await Jimp.read(imageBuffer);
+    } catch (error) {
+        throw new Error('Invalid image format');
+    }
 
-    resizePromise.then(buffer => {
-        identifyPromise.then(identified => {
-            const s3PutParams = {
-                Bucket: thumbnailBucket,
-                Key: destKey,
-                ContentType: "image/" + identified.format.toLowerCase()
-            };
+    // Validate mime type
+    const mime = image.getMIME();
+    if (!CONFIG.allowedMimeTypes.has(mime)) {
+        throw new Error('Unsupported image type');
+    }
 
-            s3PutParams.Body = buffer;
-            s3.upload(s3PutParams).promise().then(data => {
-                delete s3PutParams.Body;
-                console.log("success uploading to s3:\n ", s3PutParams);
-                var thumbnailImage = {};
-                thumbnailImage.s3key = destKey;
-                thumbnailImage.s3bucket = thumbnailBucket;
-                callback(null, {'thumbnail': thumbnailImage});
-            }).catch(function (err) {
-                delete s3PutParams.Body;
-                console.error("failure uploading to s3:\n ", s3PutParams);
-                callback(err);
-            })
-        }).catch(err => {
-            callback(err)
-        });
-    }).catch(function (err) {
-        callback(err);
-    })
-}
+    // Get dimensions with bounds checking
+    const originalWidth = Math.min(image.getWidth(), 10000);
+    const originalHeight = Math.min(image.getHeight(), 10000);
+
+    // Calculate safe dimensions
+    const scalingFactor = Math.min(
+        CONFIG.maxWidth / originalWidth,
+        CONFIG.maxHeight / originalHeight,
+        1
+    );
+
+    const width = Math.round(scalingFactor * originalWidth);
+    const height = Math.round(scalingFactor * originalHeight);
+
+    // Process image
+    if (width < originalWidth || height < originalHeight) {
+        image.resize(width, height);
+    }
+
+    image.quality(CONFIG.quality);
+
+    return {
+        buffer: await image.getBufferAsync(Jimp.AUTO),
+        mime: mime
+    };
+};
+
+exports.handler = async (event) => {
+    try {
+        // Sanitize logging
+        console.log('Processing event:', JSON.stringify(sanitizeLogData(event)));
+        
+        // Validate input
+        validateInput(event);
+
+        // Decode S3 key safely
+        const srcKey = decodeURIComponent(event.s3Key.replace(/\+/g, ' '));
+
+        // Get object from S3
+        let imageBuffer;
+        try {
+
+            const { Body, ContentType } = await s3Client.send(new GetObjectCommand({
+                Bucket: event.s3Bucket,
+                Key: srcKey
+            }));
+
+            // Validate content type early
+            if (!CONFIG.allowedMimeTypes.has(ContentType)) {
+                throw new Error('Invalid content type');
+            }
+
+            imageBuffer = await streamToBuffer(Body);
+        } catch (error) {
+            console.error('S3 fetch error:', sanitizeError(error));
+            throw new Error('Failed to fetch image');
+        }
+
+        // Process image
+        const { buffer: resizedBuffer, mime } = await processImage(imageBuffer);
+
+        // Generate secure filename
+        const destKey = generateSecureFilename(srcKey);
+
+        // Upload to S3 with security headers
+        try {
+
+            await s3Client.send(new PutObjectCommand({
+                Bucket: CONFIG.thumbnailBucket,
+                Key: `${event.userId}/${destKey}`,
+                Body: resizedBuffer,
+                ContentType: mime,
+                CacheControl: 'public, max-age=31536000',
+                ContentDisposition: 'inline',
+                Metadata: {
+                    'original-key': srcKey,
+                    'processing-date': new Date().toISOString(),
+                    'content-security-policy': "default-src 'none'; img-src 'self'"
+                }
+
+            }));
+
+        } catch (error) {
+            console.error('S3 upload error:', sanitizeError(error));
+            throw new Error('Failed to upload thumbnail');
+        }
+
+        return {
+            statusCode: 200,
+            thumbnail: {
+                s3key: `${event.userId}/${destKey}`,
+                s3bucket: CONFIG.thumbnailBucket,
+                contentType: mime
+            }
+        };
+
+    } catch (error) {
+        console.error('Error:', sanitizeError(error));
+        
+        return {
+            statusCode: 500,
+            error: {
+                message: 'Image processing failed',
+                type: error.name
+            }
+        };
+    }
+};
+
+/**
+ * Sanitizes data for logging
+ * @param {Object} data - Data to sanitize
+ * @returns {Object} Sanitized data
+ */
+const sanitizeLogData = (data) => {
+    const sanitized = { ...data };
+    // Remove sensitive fields
+    delete sanitized.credentials;
+    delete sanitized.authorization;
+    return sanitized;
+};
+
+/**
+ * Sanitizes error messages for logging
+ * @param {Error} error - Error to sanitize
+ * @returns {Object} Sanitized error
+ */
+const sanitizeError = (error) => {
+    return {
+        message: error.message,
+        type: error.name,
+        // Don't include stack trace in production
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    };
+};

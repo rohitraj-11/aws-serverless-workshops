@@ -1,38 +1,48 @@
 const util = require('util');
-const AWS = require('aws-sdk');
-const rekognition = new AWS.Rekognition();
+const { RekognitionClient, SearchFacesByImageCommand } = require("@aws-sdk/client-rekognition");
 
-exports.handler = (event, context, callback) => {
-    console.log("Reading input from event:\n", util.inspect(event, {depth: 5}));
+const rekognition = new RekognitionClient();
 
-    const srcBucket = event.s3Bucket;
-    // Object key may have spaces or unicode non-ASCII characters.
-    const srcKey = decodeURIComponent(event.s3Key.replace(/\+/g, " "));
+exports.handler = async (event, context) => {
+    try {
+        console.log("Reading input from event:\n", util.inspect(event, {depth: 5}));
 
-    var params = {
-        CollectionId: process.env.REKOGNITION_COLLECTION_ID,
-        Image: {
-            S3Object: {
-                Bucket: srcBucket,
-                Name: srcKey
-            }
-        },
-        FaceMatchThreshold: 70.0,
-        MaxFaces: 3
-    };
-    rekognition.searchFacesByImage(params).promise().then(data => {
+        const srcBucket = event.s3Bucket;
+        // Object key may have spaces or unicode non-ASCII characters.
+        const srcKey = decodeURIComponent(event.s3Key.replace(/\+/g, " "));
+
+        const params = {
+            CollectionId: process.env.REKOGNITION_COLLECTION_ID,
+            Image: {
+                S3Object: {
+                    Bucket: srcBucket,
+                    Name: srcKey
+                }
+            },
+            FaceMatchThreshold: 95.0,
+            MaxFaces: 3
+        };
+
+        const command = new SearchFacesByImageCommand(params);
+        const data = await rekognition.send(command);
+        console.log("Face search result: ",data)
         if (data.FaceMatches.length > 0) {
-            callback(new FaceAlreadyExistsError());
-        } else {
-            callback(null, null);
+            throw new FaceAlreadyExistsError();
         }
-    }).catch(err => {
-        callback(err);
-    });
+        return null;
+
+    } catch (err) {
+        if (err instanceof FaceAlreadyExistsError) {
+            throw err;
+        }
+        console.error('Error:', err);
+        throw err;
+    }
 };
 
-function FaceAlreadyExistsError() {
-    this.name = "FaceAlreadyExistsError";
-    this.message = "Face in the picture is already in the system. ";
+class FaceAlreadyExistsError extends Error {
+    constructor() {
+        super("Face in the picture is already in the system.");
+        this.name = "FaceAlreadyExistsError";
+    }
 }
-FaceAlreadyExistsError.prototype = new Error();
